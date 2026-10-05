@@ -4,6 +4,10 @@
 
 Плагин для Lidarr который предоставляет метаданные исполнителей (альбомов) с Yandex Music. Одновременно работаем с Yandex Music, Deezer и MusicBrainz. Так же умеет импортировать плейлисты с Yandex Music и Deezer.
 
+Плагин рекомендуется использовать совместно с [Yandex.Music indexer + download client](https://github.com/kitsunoff/yandex-music-lidarr). По желанию можно использовать [плагин для Deezer](https://github.com/TrevTV/Lidarr.Plugin.Deezer). 
+
+При совместном использовании можно получить Lidarr который полностью работает с YandexMusic.
+
 </div>
 
 ---
