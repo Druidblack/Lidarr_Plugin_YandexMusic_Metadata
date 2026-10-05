@@ -1,0 +1,18 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lidarr.Plugin.YandexMusic.Metadata", "src\Lidarr.Plugin.YandexMusic.Metadata\Lidarr.Plugin.YandexMusic.Metadata.csproj", "{D4832CF0-BD39-4DBF-86EE-1AAB4BC7CE1D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D4832CF0-BD39-4DBF-86EE-1AAB4BC7CE1D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D4832CF0-BD39-4DBF-86EE-1AAB4BC7CE1D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D4832CF0-BD39-4DBF-86EE-1AAB4BC7CE1D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D4832CF0-BD39-4DBF-86EE-1AAB4BC7CE1D}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
