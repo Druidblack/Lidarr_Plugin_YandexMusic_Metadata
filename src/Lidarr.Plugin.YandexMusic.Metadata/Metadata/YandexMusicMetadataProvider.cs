@@ -60,6 +60,7 @@ public sealed partial class YandexMusicMetadataProvider :
             return _lidarrDefault.GetArtistInfo(lidarrId, metadataProfileId);
 
         var settings = GetSettings();
+        EnsureRussianGenreCatalog(settings);
         var source = _client.GetArtist(id);
         var artist = MapArtist(source, settings);
 
@@ -86,6 +87,7 @@ public sealed partial class YandexMusicMetadataProvider :
             return _lidarrDefault.GetAlbumInfo(id);
 
         var settings = GetSettings();
+        EnsureRussianGenreCatalog(settings);
 
         if (settings.LightweightAlbumRequests)
         {
@@ -238,6 +240,8 @@ public sealed partial class YandexMusicMetadataProvider :
     {
         var yandexEnabled = IsYandexSourceEnabled();
         var deezerEnabled = IsDeezerSourceEnabled();
+        if (yandexEnabled)
+            EnsureRussianGenreCatalog(GetSettings());
 
         if (deezerEnabled && DeezerIdParser.TryArtistId(title, out var deezerId))
         {
@@ -395,6 +399,8 @@ public sealed partial class YandexMusicMetadataProvider :
     {
         var yandexEnabled = IsYandexSourceEnabled();
         var deezerEnabled = IsDeezerSourceEnabled();
+        if (yandexEnabled)
+            EnsureRussianGenreCatalog(GetSettings());
 
         if (yandexEnabled && IsExplicitYandexAlbumReference(title))
         {
@@ -559,6 +565,14 @@ public sealed partial class YandexMusicMetadataProvider :
         return definition?.Enable ?? false;
     }
 
+    private void EnsureRussianGenreCatalog(YandexMusicMetadataSettings settings)
+    {
+        if (!settings.Genres)
+            return;
+
+        YandexGenreTranslator.EnsureLoaded(_client, _logger);
+    }
+
     private YandexMusicMetadataSettings GetSettings()
     {
         return GetDefinition()?.Settings as YandexMusicMetadataSettings ?? new YandexMusicMetadataSettings();
@@ -712,10 +726,12 @@ public sealed partial class YandexMusicMetadataProvider :
     private Artist GetPodcastArtistInfo(long albumId, bool lookup = false)
     {
         var source = _client.GetAlbum(albumId);
+        var settings = GetSettings();
+        EnsureRussianGenreCatalog(settings);
         if (!IsPodcast(source))
             throw new InvalidOperationException($"Yandex album {albumId} is not a podcast");
 
-        return MapPodcastArtist(source, GetSettings(), lookup);
+        return MapPodcastArtist(source, settings, lookup);
     }
 
     private Tuple<string, Album, List<ArtistMetadata>> GetPodcastAlbumInfo(
@@ -794,7 +810,7 @@ public sealed partial class YandexMusicMetadataProvider :
             ForeignArtistId = YandexIdParser.PodcastArtistForeignId(source.Id),
             OldForeignArtistIds = new List<string>(),
             Genres = settings.Genres && !string.IsNullOrWhiteSpace(source.Genre)
-                ? new List<string> { source.Genre! }
+                ? new List<string> { YandexGenreTranslator.Translate(source.Genre) }
                 : new List<string>(),
             Overview = BuildAlbumOverview(source),
             Disambiguation = "Yandex Music Podcast",
@@ -1021,7 +1037,7 @@ public sealed partial class YandexMusicMetadataProvider :
             Aliases = source.DbAliases ?? new List<string>(),
             ForeignArtistId = YandexIdParser.ArtistForeignId(source.Id),
             OldForeignArtistIds = new List<string>(),
-            Genres = settings.Genres ? source.Genres ?? new List<string>() : new List<string>(),
+            Genres = settings.Genres ? YandexGenreTranslator.Translate(source.Genres) : new List<string>(),
             Overview = source.Description ?? string.Empty,
             Disambiguation = string.Empty,
             Type = source.ArtistType ?? string.Empty,
@@ -1088,7 +1104,7 @@ public sealed partial class YandexMusicMetadataProvider :
                 ? new List<Links> { new() { Url = $"https://music.yandex.ru/album/{source.Id}", Name = "Yandex Music" } }
                 : new List<Links>(),
             Genres = settings.Genres && !string.IsNullOrWhiteSpace(source.Genre)
-                ? new List<string> { source.Genre! }
+                ? new List<string> { YandexGenreTranslator.Translate(source.Genre) }
                 : new List<string>(),
             CleanTitle = NzbDrone.Core.Parser.Parser.CleanArtistName(source.Title),
             AnyReleaseOk = true

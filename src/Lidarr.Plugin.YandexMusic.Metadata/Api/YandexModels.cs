@@ -4,6 +4,28 @@ namespace Lidarr.Plugin.YandexMusicMetadata.Api;
 
 
 
+
+public sealed class YandexGenresResponse
+{
+    public List<YandexGenre> Result { get; set; } = new();
+}
+
+public sealed class YandexGenre
+{
+    public string Id { get; set; } = string.Empty;
+    public string? Title { get; set; }
+    public string? FullTitle { get; set; }
+    public string? UrlPart { get; set; }
+    public Dictionary<string, YandexGenreTitle> Titles { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public List<YandexGenre> SubGenres { get; set; } = new();
+}
+
+public sealed class YandexGenreTitle
+{
+    public string? Title { get; set; }
+    public string? FullTitle { get; set; }
+}
+
 public sealed class YandexPlaylistResponse { public YandexPlaylist Result { get; set; } = new(); }
 
 public sealed class YandexPlaylist

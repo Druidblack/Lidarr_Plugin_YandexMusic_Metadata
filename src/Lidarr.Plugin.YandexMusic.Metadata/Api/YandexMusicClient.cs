@@ -32,6 +32,9 @@ internal sealed class YandexMusicClient
     private static readonly object AlbumCacheLock = new();
     private static readonly Dictionary<long, AlbumCacheEntry> AlbumCache = new();
 
+    private static readonly object GenreCacheLock = new();
+    private static GenreTranslationsCacheEntry? GenreTranslationsCache;
+
     private readonly IHttpClient _httpClient;
     private readonly Logger _logger;
 
@@ -180,6 +183,92 @@ internal sealed class YandexMusicClient
             AlbumCache[id] = new AlbumCacheEntry(DateTime.UtcNow, response.Result);
             return response.Result;
         }
+    }
+
+    public Dictionary<string, string> GetRussianGenreTranslations()
+    {
+        lock (GenreCacheLock)
+        {
+            if (GenreTranslationsCache != null &&
+                DateTime.UtcNow - GenreTranslationsCache.CachedAtUtc < TimeSpan.FromHours(24))
+            {
+                _logger.Trace("Yandex Music genre catalog: cache hit");
+                return new Dictionary<string, string>(GenreTranslationsCache.Translations, StringComparer.OrdinalIgnoreCase);
+            }
+
+            GenreTranslationsCache = null;
+            var response = Get<YandexGenresResponse>($"{BaseUrl}/genres");
+            var translations = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var genre in response?.Result ?? new List<YandexGenre>())
+                AddGenreTranslations(genre, translations);
+
+            if (translations.Count > 0)
+            {
+                GenreTranslationsCache = new GenreTranslationsCacheEntry(DateTime.UtcNow, translations);
+                _logger.Debug("Yandex Music genre catalog: loaded {0} Russian aliases", translations.Count);
+            }
+
+            return new Dictionary<string, string>(translations, StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static void AddGenreTranslations(YandexGenre genre, Dictionary<string, string> translations)
+    {
+        var russian = GetRussianGenreTitle(genre);
+        if (!string.IsNullOrWhiteSpace(russian))
+        {
+            AddGenreAlias(translations, genre.Id, russian);
+            AddGenreAlias(translations, genre.UrlPart, russian);
+            AddGenreAlias(translations, genre.Title, russian);
+            AddGenreAlias(translations, genre.FullTitle, russian);
+
+            if (genre.Titles.TryGetValue("en", out var english))
+            {
+                AddGenreAlias(translations, english.Title, russian);
+                AddGenreAlias(translations, english.FullTitle, russian);
+            }
+
+            if (genre.Titles.TryGetValue("ru", out var ru))
+            {
+                AddGenreAlias(translations, ru.Title, russian);
+                AddGenreAlias(translations, ru.FullTitle, russian);
+            }
+        }
+
+        foreach (var child in genre.SubGenres ?? new List<YandexGenre>())
+            AddGenreTranslations(child, translations);
+    }
+
+    private static string? GetRussianGenreTitle(YandexGenre genre)
+    {
+        if (genre.Titles.TryGetValue("ru", out var ru))
+        {
+            if (!string.IsNullOrWhiteSpace(ru.Title))
+                return ru.Title.Trim();
+            if (!string.IsNullOrWhiteSpace(ru.FullTitle))
+                return ru.FullTitle.Trim();
+        }
+
+        // Never let an English generic title override a known Russian fallback.
+        // Some responses can omit one locale block; accept the generic fields only
+        // when they already contain Cyrillic and therefore are clearly localized.
+        if (!string.IsNullOrWhiteSpace(genre.Title) && ContainsCyrillic(genre.Title))
+            return genre.Title.Trim();
+        if (!string.IsNullOrWhiteSpace(genre.FullTitle) && ContainsCyrillic(genre.FullTitle))
+            return genre.FullTitle.Trim();
+        return null;
+    }
+
+    private static bool ContainsCyrillic(string value)
+    {
+        return value.Any(ch => ch >= '\u0400' && ch <= '\u04FF');
+    }
+
+    private static void AddGenreAlias(Dictionary<string, string> translations, string? alias, string russian)
+    {
+        if (!string.IsNullOrWhiteSpace(alias))
+            translations[alias.Trim()] = russian;
     }
 
     public List<YandexArtist> SearchArtists(string query, int page = 0)
@@ -442,6 +531,7 @@ internal sealed class YandexMusicClient
     private sealed record ArtistProfileCacheEntry(DateTime CachedAtUtc, YandexArtistResult Profile);
     private sealed record DirectAlbumsCacheEntry(DateTime CachedAtUtc, List<YandexAlbum> Albums);
     private sealed record AlbumCacheEntry(DateTime CachedAtUtc, YandexAlbum Album);
+    private sealed record GenreTranslationsCacheEntry(DateTime CachedAtUtc, Dictionary<string, string> Translations);
 
     private T Get<T>(string url) where T : class, new()
     {

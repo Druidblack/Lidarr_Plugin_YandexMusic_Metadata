@@ -9,8 +9,8 @@
     <MinimumLidarrVersion>3.1.3.0</MinimumLidarrVersion>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <EnableNETAnalyzers>false</EnableNETAnalyzers>
-    <Version>1.0.1</Version>
-    <InformationalVersion>1.0.1</InformationalVersion>
+    <Version>1.0.2</Version>
+    <InformationalVersion>1.0.2</InformationalVersion>
   </PropertyGroup>
 
   <!--
