@@ -10,10 +10,56 @@ internal static class YandexIdParser
     public static string ArtistForeignId(long id) => $"yandex:artist:{id}";
     public static string PodcastArtistForeignId(long albumId) => $"yandex:podcast:{albumId}";
     public static string AlbumForeignId(long id, long? parentArtistId = null) => parentArtistId.HasValue ? $"yandex:album:{id}:artist:{parentArtistId.Value}" : $"yandex:album:{id}";
-    public static string ReleaseForeignId(long id, long? parentArtistId = null) => parentArtistId.HasValue ? $"yandex:release:{id}:artist:{parentArtistId.Value}" : $"yandex:release:{id}";
-    public static string TrackForeignId(long id, long? parentArtistId = null) => parentArtistId.HasValue ? $"yandex:track:{id}:artist:{parentArtistId.Value}" : $"yandex:track:{id}";
-    public static string RecordingForeignId(long id, long? parentArtistId = null) => parentArtistId.HasValue ? $"yandex:recording:{id}:artist:{parentArtistId.Value}" : $"yandex:recording:{id}";
 
+    // v0.2.9+: releases use a compact v2 namespace. Parent-scoped releases are
+    // intentionally distinct for the same Yandex album when it is exposed under
+    // several Lidarr artists (common for multi-reader audiobooks).
+    public static string ReleaseForeignId(long albumId, long? parentArtistId = null) =>
+        parentArtistId.HasValue ? $"yandex:r:{albumId}:a:{parentArtistId.Value}" : $"yandex:r:{albumId}";
+
+    // Tracks must be album-scoped as well as artist-scoped. Yandex can reuse a
+    // track/episode id in duplicate/reissue/participation album graphs while Lidarr
+    // enforces Tracks.ForeignTrackId globally across the whole database.
+    public static string TrackForeignId(long trackId, long albumId, long? parentArtistId = null) =>
+        parentArtistId.HasValue
+            ? $"yandex:t:{trackId}:al:{albumId}:a:{parentArtistId.Value}"
+            : $"yandex:t:{trackId}:al:{albumId}";
+
+    public static string RecordingForeignId(long trackId, long albumId, long? parentArtistId = null) =>
+        parentArtistId.HasValue
+            ? $"yandex:rec:{trackId}:al:{albumId}:a:{parentArtistId.Value}"
+            : $"yandex:rec:{trackId}:al:{albumId}";
+
+    // Safe migration aliases from v0.2.8. For parent-scoped content never expose
+    // the older bare id as an alias: it is shared by every narrator copy and makes
+    // Lidarr pull children from another artist during Refresh*Service matching.
+    public static string LegacyReleaseForeignId(long albumId, long? parentArtistId = null) =>
+        parentArtistId.HasValue ? $"yandex:release:{albumId}:artist:{parentArtistId.Value}" : $"yandex:release:{albumId}";
+
+    public static string LegacyTrackForeignId(long trackId, long? parentArtistId = null) =>
+        parentArtistId.HasValue ? $"yandex:track:{trackId}:artist:{parentArtistId.Value}" : $"yandex:track:{trackId}";
+
+    public static string LegacyRecordingForeignId(long trackId, long? parentArtistId = null) =>
+        parentArtistId.HasValue ? $"yandex:recording:{trackId}:artist:{parentArtistId.Value}" : $"yandex:recording:{trackId}";
+
+    public static bool IsCurrentReleaseForeignId(string? value, long albumId, long? parentArtistId) =>
+        string.Equals(value, ReleaseForeignId(albumId, parentArtistId), StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsCurrentTrackForeignId(string? value, long albumId, long? parentArtistId)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var albumToken = $":al:{albumId}";
+        if (!value.StartsWith("yandex:t:", StringComparison.OrdinalIgnoreCase) ||
+            !value.Contains(albumToken, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var artistToken = parentArtistId.HasValue ? $":a:{parentArtistId.Value}" : string.Empty;
+        return parentArtistId.HasValue
+            ? value.EndsWith(artistToken, StringComparison.OrdinalIgnoreCase)
+            : !Regex.IsMatch(value, @":a:\d+$", RegexOptions.IgnoreCase);
+    }
 
     public static bool TryPodcastArtistId(string? value, out long albumId)
     {

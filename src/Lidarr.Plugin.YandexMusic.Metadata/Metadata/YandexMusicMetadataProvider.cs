@@ -1,6 +1,8 @@
+using Newtonsoft.Json.Linq;
 using NLog;
 using NzbDrone.Common.Http;
 using NzbDrone.Core.Extras.Metadata;
+using NzbDrone.Core.ImportLists.Exclusions;
 using NzbDrone.Core.MediaCover;
 using CoreMediaCover = NzbDrone.Core.MediaCover.MediaCover;
 using NzbDrone.Core.MetadataSource;
@@ -23,17 +25,23 @@ public sealed partial class YandexMusicMetadataProvider :
     private readonly SkyHookProxy _lidarrDefault;
     private readonly IMetadataFactory _metadataFactory;
     private readonly IAlbumService _albumService;
+    private readonly IArtistService _artistService;
+    private readonly IImportListExclusionService _importListExclusionService;
     private readonly Logger _logger;
 
     public YandexMusicMetadataProvider(
         IHttpClient httpClient,
         IMetadataFactory metadataFactory,
         IAlbumService albumService,
+        IArtistService artistService,
+        IImportListExclusionService importListExclusionService,
         SkyHookProxy lidarrDefault,
         Logger logger)
     {
         _metadataFactory = metadataFactory;
         _albumService = albumService;
+        _artistService = artistService;
+        _importListExclusionService = importListExclusionService;
         _lidarrDefault = lidarrDefault;
         _logger = logger;
         _client = new YandexMusicClient(httpClient, logger);
@@ -105,9 +113,20 @@ public sealed partial class YandexMusicMetadataProvider :
         // UpsertMany() them and overwrite richer artist metadata already saved by
         // GetArtistInfo() (overview, social links and full image set). Resolve each
         // album-level artist through /about-artist before returning metadata to Lidarr.
-        var artists = source.Artists
+        // Audiobook credits are less regular than music credits:
+        //  * several narrators can be listed directly in album.artists;
+        //  * extra narrators can be hidden inside artist.decomposed;
+        //  * chapter artists can differ from album.artists entirely.
+        // Flatten the album-level contributors first. Track-only contributors are
+        // added to the same dictionary by MapRelease below.
+        var albumContributors = ExpandArtistContributors(source.Artists)
+            .Where(a => a.Id > 0)
             .GroupBy(a => a.Id)
-            .Select(g => MapAlbumArtistMetadata(g.First(), settings))
+            .Select(g => g.First())
+            .ToList();
+
+        var artists = albumContributors
+            .Select(a => MapAlbumArtistMetadata(a, settings))
             .GroupBy(a => a.ForeignArtistId)
             .Select(g => g.First())
             .ToList();
@@ -125,18 +144,68 @@ public sealed partial class YandexMusicMetadataProvider :
                 var parent = _client.GetArtistProfile(parentArtistId.Value);
                 primaryMetadata = MapArtistMetadata(parent.Artist, settings, parent.AllCovers);
                 dict[parentForeignId] = primaryMetadata;
-                artists.Add(primaryMetadata);
             }
         }
         else
         {
-            if (artists.Count == 0)
-                throw new InvalidOperationException($"Yandex album {albumId} has no artists");
+            // For audiobooks, the top-level album credits can contain a composite
+            // attribution while every actual chapter is read by one stable narrator.
+            // Prefer that sole chapter narrator as Lidarr's parent artist. This makes
+            // books such as "Охота на лис" attach to the real reader rather than to
+            // a wrapper credit. Multi-reader productions keep Yandex's first
+            // album-level contributor as their stable parent.
+            var audiobookPrimary = IsAudiobook(source)
+                ? GetSoleTrackArtist(source)
+                : null;
 
-            primaryMetadata = artists[0];
+            if (audiobookPrimary != null)
+            {
+                var primaryForeignId = YandexIdParser.ArtistForeignId(audiobookPrimary.Id);
+                if (!dict.TryGetValue(primaryForeignId, out primaryMetadata!))
+                {
+                    primaryMetadata = MapAlbumArtistMetadata(audiobookPrimary, settings);
+                    dict[primaryForeignId] = primaryMetadata;
+                }
+            }
+            else
+            {
+                if (artists.Count == 0)
+                {
+                    // A malformed audiobook can still have no album-level artist but
+                    // valid chapter artists. Use the first real chapter contributor
+                    // before giving up.
+                    var trackArtist = GetFirstTrackArtist(source);
+                    if (trackArtist == null)
+                        throw new InvalidOperationException($"Yandex album {albumId} has no artists");
+
+                    primaryMetadata = MapAlbumArtistMetadata(trackArtist, settings);
+                    dict[primaryMetadata.ForeignArtistId] = primaryMetadata;
+                }
+                else
+                {
+                    primaryMetadata = artists[0];
+                }
+            }
         }
 
-        var ratingArtistId = parentArtistId ?? source.Artists.FirstOrDefault()?.Id;
+        // Direct audiobook lookups start with a bare yandex:album:<id>. By this
+        // point we have already resolved the real parent narrator. Canonicalize the
+        // album to the same parent-aware id used when it is discovered through the
+        // narrator page; otherwise Lidarr creates a second, trackless bare album.
+        if (!parentArtistId.HasValue && IsAudiobook(source))
+        {
+            var inferredParentArtistId = TryParseYandexArtistId(primaryMetadata.ForeignArtistId);
+            if (inferredParentArtistId.HasValue)
+            {
+                parentArtistId = inferredParentArtistId.Value;
+                _logger.Debug(
+                    "Yandex Music audiobook {0}: inferred parent artist {1} for direct album lookup",
+                    albumId,
+                    parentArtistId.Value);
+            }
+        }
+
+        var ratingArtistId = parentArtistId ?? TryParseYandexArtistId(primaryMetadata.ForeignArtistId);
         var ratings = settings.CalculateAlbumRatings
             ? BuildAlbumRatings(source, ratingArtistId)
             : new Ratings();
@@ -153,7 +222,16 @@ public sealed partial class YandexMusicMetadataProvider :
             primaryMetadata.ForeignArtistId,
             album.AlbumReleases.Value.Sum(r => r.Tracks.Value.Count));
 
-        return Tuple.Create(primaryMetadata.ForeignArtistId, album, artists);
+        // MapRelease can discover artists that are present only on chapters.
+        // Return the complete dictionary rather than the original album-level list,
+        // otherwise Lidarr receives Track.ArtistMetadata references for artists it
+        // was never asked to upsert.
+        var returnedArtists = dict.Values
+            .Where(a => a != null && !string.IsNullOrWhiteSpace(a.ForeignArtistId))
+            .DistinctBy(a => a.ForeignArtistId)
+            .ToList();
+
+        return Tuple.Create(primaryMetadata.ForeignArtistId, album, returnedArtists);
     }
 
     public List<Artist> SearchForNewArtist(string title)
@@ -509,6 +587,46 @@ public sealed partial class YandexMusicMetadataProvider :
         if (existing == null || existing.LastInfoSync == DateTime.MinValue)
             return null;
 
+        // A directly added album can already have LastInfoSync set while its child
+        // graph has not been persisted yet. Reusing that half-created object makes
+        // RefreshAlbumService see AlbumReleases.Count == 0 and report the album as
+        // removed from metadata. Never use lightweight mode for an empty graph.
+        var existingReleases = existing.AlbumReleases.Value;
+        if (existingReleases == null || existingReleases.Count == 0)
+        {
+            _logger.Debug(
+                "{0} lightweight requests: stored album {1} has no releases; forcing full remote refresh",
+                sourceName,
+                requestedId);
+            return null;
+        }
+
+        // Audiobooks are useful to Lidarr only after the chapter graph has been
+        // materialized. A canonical audiobook with a release but zero tracks is the
+        // same partial-add state, so force /with-tracks instead of freezing 0 tracks.
+        if (string.Equals(sourceName, "Yandex Music", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(existing.Disambiguation, "Audiobook", StringComparison.OrdinalIgnoreCase) &&
+            existingReleases.Sum(r => r.Tracks.Value?.Count ?? 0) == 0)
+        {
+            _logger.Debug(
+                "Yandex Music lightweight requests: stored audiobook {0} has no tracks; forcing full /with-tracks refresh",
+                requestedId);
+            return null;
+        }
+
+        // v0.2.9 changed Yandex release/track ids to a collision-safe schema.
+        // Do not let lightweight mode freeze a pre-v0.2.9 graph in the database:
+        // force one full /with-tracks refresh so Lidarr can migrate the previous
+        // parent-aware ids through OldForeign*Ids. Deezer keeps its own id scheme.
+        if (string.Equals(sourceName, "Yandex Music", StringComparison.OrdinalIgnoreCase) &&
+            NeedsYandexChildIdMigration(existing, requestedId))
+        {
+            _logger.Debug(
+                "Yandex Music lightweight requests: stored album {0} uses legacy release/track ids; forcing one full refresh for v0.2.9 id migration",
+                requestedId);
+            return null;
+        }
+
         // RefreshArtistService always asks IProvideAlbumInfo for every local album,
         // even when direct-albums already confirms that the album still exists.
         // In lightweight mode reuse Lidarr's already-synchronised album graph so
@@ -549,6 +667,46 @@ public sealed partial class YandexMusicMetadataProvider :
             releases.Sum(r => r.Tracks.Value.Count));
 
         return Tuple.Create(primaryArtist.ForeignArtistId, existing, metadata);
+    }
+
+
+    private static bool NeedsYandexChildIdMigration(Album existing, string requestedId)
+    {
+        if (!YandexIdParser.TryAlbumId(requestedId, out var albumId))
+            return false;
+
+        long? parentArtistId = null;
+        if (YandexIdParser.TryAlbumParentArtistId(requestedId, out var parentId))
+            parentArtistId = parentId;
+
+        // v0.2.9 could save an audiobook added by direct album URL as the bare
+        // yandex:album:<id>, even though its ArtistMetadata already identified the
+        // narrator. Do not reuse that graph in lightweight mode: force a full
+        // refresh so GetAlbumInfo can canonicalize it to
+        // yandex:album:<id>:artist:<narratorId>.
+        var storedPrimaryArtist = existing.ArtistMetadata.Value;
+        if (!parentArtistId.HasValue &&
+            string.Equals(existing.Disambiguation, "Audiobook", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(existing.ForeignAlbumId, YandexIdParser.AlbumForeignId(albumId), StringComparison.OrdinalIgnoreCase) &&
+            storedPrimaryArtist != null &&
+            TryParseYandexArtistId(storedPrimaryArtist.ForeignArtistId).HasValue)
+        {
+            return true;
+        }
+
+        foreach (var release in existing.AlbumReleases.Value)
+        {
+            if (!YandexIdParser.IsCurrentReleaseForeignId(release.ForeignReleaseId, albumId, parentArtistId))
+                return true;
+
+            foreach (var track in release.Tracks.Value)
+            {
+                if (!YandexIdParser.IsCurrentTrackForeignId(track.ForeignTrackId, albumId, parentArtistId))
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     private Artist GetPodcastArtistInfo(long albumId, bool lookup = false)
@@ -672,14 +830,122 @@ public sealed partial class YandexMusicMetadataProvider :
             ? result.Albums.Max(a => a.LikesCount)
             : 0;
 
+        // Load the current DB/exclusion state once per artist refresh. Calling
+        // GetAllAlbums()/All() for every release is unnecessarily expensive for
+        // narrators with hundreds of books.
+        var existingAlbums = _albumService.GetAllAlbums();
+        var localArtistMetadataId = _artistService.FindById(metadata.ForeignArtistId)?.ArtistMetadataId;
+        var exclusionIds = _importListExclusionService.All()
+            .Select(x => x.ForeignId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         artist.Albums = releases
             .Where(a => ShouldIncludeRelease(a, settings))
             .GroupBy(a => a.Id)
             .Select(g => g.First())
+            .Where(a => !ShouldExcludeDuplicateAudiobook(a, metadata, parentArtistId, localArtistMetadataId, existingAlbums, exclusionIds))
             .Select(a => MapAlbumSummary(a, metadata, settings, parentArtistId, maxDirectLikes))
             .ToList();
 
         return artist;
+    }
+
+    private bool ShouldExcludeDuplicateAudiobook(
+        YandexAlbum source,
+        ArtistMetadata currentArtist,
+        long currentParentArtistId,
+        int? currentArtistMetadataId,
+        IReadOnlyCollection<Album> existingAlbums,
+        HashSet<string> exclusionIds)
+    {
+        if (!IsAudiobook(source))
+            return false;
+
+        var currentForeignAlbumId = YandexIdParser.AlbumForeignId(source.Id, currentParentArtistId);
+        var existingCopies = existingAlbums
+            .Where(a =>
+                YandexIdParser.TryAlbumId(a.ForeignAlbumId, out var existingAlbumId) &&
+                existingAlbumId == source.Id)
+            .ToList();
+
+        if (existingCopies.Count == 0)
+            return exclusionIds.Contains(currentForeignAlbumId);
+
+        // If this exact narrator copy is already in Lidarr, it is the canonical
+        // copy for this artist refresh and must remain in the remote graph. This
+        // also prevents an already-added album from being hidden merely because
+        // a stale exclusion exists.
+        if (existingCopies.Any(a => IsAlbumOwnedByArtist(a, currentParentArtistId, currentArtistMetadataId)))
+            return false;
+
+        // The same raw Yandex audiobook ID already exists under another narrator.
+        // Keep the first stored copy globally, hide this narrator-specific copy
+        // from RefreshArtistService, and persist the exact canonical ID in Lidarr's
+        // Import List Exclusions so an import list cannot add it later either.
+        EnsureAudiobookImportListExclusion(
+            currentForeignAlbumId,
+            currentArtist.Name,
+            source.Title,
+            exclusionIds);
+
+        var existingIds = string.Join(", ", existingCopies.Select(a => a.ForeignAlbumId));
+        _logger.Info(
+            "Yandex Music audiobook {0} [{1}] already exists under another narrator ({2}); excluding {3}",
+            source.Id,
+            source.Title,
+            existingIds,
+            currentForeignAlbumId);
+
+        return true;
+    }
+
+    private void EnsureAudiobookImportListExclusion(
+        string foreignAlbumId,
+        string artistName,
+        string albumTitle,
+        HashSet<string> exclusionIds)
+    {
+        if (exclusionIds.Contains(foreignAlbumId))
+            return;
+
+        try
+        {
+            _importListExclusionService.Add(new ImportListExclusion
+            {
+                ForeignId = foreignAlbumId,
+                Name = $"{artistName} - {albumTitle}"
+            });
+        }
+        catch (Exception ex)
+        {
+            // A bulk refresh can process related narrators close together. If
+            // another refresh inserted the same exclusion between our snapshot
+            // and Add(), treat the unique-key race as success. Re-throw genuine
+            // persistence failures so Lidarr can retry the metadata refresh.
+            if (_importListExclusionService.FindByForeignId(foreignAlbumId) == null)
+                throw;
+
+            _logger.Debug(ex,
+                "Yandex Music audiobook exclusion {0} was inserted concurrently",
+                foreignAlbumId);
+        }
+
+        exclusionIds.Add(foreignAlbumId);
+    }
+
+    private static bool IsAlbumOwnedByArtist(Album album, long artistId, int? currentArtistMetadataId)
+    {
+        if (YandexIdParser.TryAlbumParentArtistId(album.ForeignAlbumId, out var encodedArtistId))
+            return encodedArtistId == artistId;
+
+        // Compatibility with pre-parent-aware bare album IDs. GetAllAlbums() does
+        // not eager-load ArtistMetadata, so never touch Album.ArtistMetadata.Value
+        // here (that causes an N+1 database query storm on large libraries).
+        // ArtistMetadataId is an eager scalar column and is sufficient to identify
+        // whether the legacy bare album already belongs to the current narrator.
+        return currentArtistMetadataId.HasValue &&
+               album.ArtistMetadataId == currentArtistMetadataId.Value;
     }
 
     private static bool ShouldIncludeRelease(YandexAlbum source, YandexMusicMetadataSettings settings)
@@ -851,16 +1117,30 @@ public sealed partial class YandexMusicMetadataProvider :
                 for (var i = 0; i < volume.Count; i++)
                 {
                     var sourceTrack = volume[i];
-                    var trackArtist = sourceTrack.Artists.FirstOrDefault();
+                    var trackContributors = ExpandArtistContributors(sourceTrack.Artists)
+                        .Where(a => a.Id > 0)
+                        .GroupBy(a => a.Id)
+                        .Select(g => g.First())
+                        .ToList();
+                    var trackArtist = trackContributors.FirstOrDefault();
+
+                    // Preserve every contributor in the metadata dictionary even
+                    // though Lidarr's Track model can reference only one artist.
+                    // This is important for audiobook ensembles and decomposed
+                    // credits: RefreshAlbumService must know every ArtistMetadata
+                    // object referenced by the returned graph.
+                    foreach (var contributor in trackContributors)
+                    {
+                        var contributorKey = YandexIdParser.ArtistForeignId(contributor.Id);
+                        if (!artists.ContainsKey(contributorKey))
+                            artists[contributorKey] = MapArtistMetadata(contributor, settings);
+                    }
+
                     ArtistMetadata artistMetadata;
                     if (trackArtist != null)
                     {
                         var key = YandexIdParser.ArtistForeignId(trackArtist.Id);
-                        if (!artists.TryGetValue(key, out artistMetadata!))
-                        {
-                            artistMetadata = MapArtistMetadata(trackArtist, settings);
-                            artists[key] = artistMetadata;
-                        }
+                        artistMetadata = artists[key];
                     }
                     else
                     {
@@ -877,14 +1157,16 @@ public sealed partial class YandexMusicMetadataProvider :
                     {
                         ArtistMetadata = artistMetadata,
                         Title = sourceTrack.Title,
-                        ForeignTrackId = YandexIdParser.TrackForeignId(sourceTrack.Id, parentArtistId),
-                        OldForeignTrackIds = parentArtistId.HasValue
-                            ? new List<string> { YandexIdParser.TrackForeignId(sourceTrack.Id) }
-                            : new List<string>(),
-                        ForeignRecordingId = YandexIdParser.RecordingForeignId(sourceTrack.Id, parentArtistId),
-                        OldForeignRecordingIds = parentArtistId.HasValue
-                            ? new List<string> { YandexIdParser.RecordingForeignId(sourceTrack.Id) }
-                            : new List<string>(),
+                        ForeignTrackId = YandexIdParser.TrackForeignId(sourceTrack.Id, source.Id, parentArtistId),
+                        OldForeignTrackIds = new List<string>
+                        {
+                            YandexIdParser.LegacyTrackForeignId(sourceTrack.Id, parentArtistId)
+                        },
+                        ForeignRecordingId = YandexIdParser.RecordingForeignId(sourceTrack.Id, source.Id, parentArtistId),
+                        OldForeignRecordingIds = new List<string>
+                        {
+                            YandexIdParser.LegacyRecordingForeignId(sourceTrack.Id, parentArtistId)
+                        },
                         TrackNumber = trackNumber.ToString(),
                         AbsoluteTrackNumber = 0,
                         Duration = sourceTrack.DurationMs,
@@ -916,9 +1198,10 @@ public sealed partial class YandexMusicMetadataProvider :
         return new AlbumRelease
         {
             ForeignReleaseId = YandexIdParser.ReleaseForeignId(source.Id, parentArtistId),
-            OldForeignReleaseIds = parentArtistId.HasValue
-                ? new List<string> { YandexIdParser.ReleaseForeignId(source.Id) }
-                : new List<string>(),
+            OldForeignReleaseIds = new List<string>
+            {
+                YandexIdParser.LegacyReleaseForeignId(source.Id, parentArtistId)
+            },
             Title = source.Title,
             Status = "Official",
             Label = settings.Labels
@@ -1043,6 +1326,79 @@ public sealed partial class YandexMusicMetadataProvider :
 
         if (hasTracks)
             album.ReleaseDate = UnknownAudiobookReleaseDate;
+    }
+
+    private static List<YandexArtist> ExpandArtistContributors(IEnumerable<YandexArtist>? sourceArtists)
+    {
+        var result = new List<YandexArtist>();
+        if (sourceArtists == null)
+            return result;
+
+        var seen = new HashSet<long>();
+
+        void AddArtist(YandexArtist? artist)
+        {
+            if (artist == null || artist.Id <= 0)
+                return;
+
+            if (seen.Add(artist.Id))
+                result.Add(artist);
+
+            if (artist.Decomposed == null)
+                return;
+
+            foreach (var token in artist.Decomposed)
+            {
+                if (token is not JObject obj)
+                    continue;
+
+                try
+                {
+                    AddArtist(obj.ToObject<YandexArtist>());
+                }
+                catch
+                {
+                    // "decomposed" is a mixed array that also contains separators.
+                    // Ignore malformed/non-artist objects rather than failing an
+                    // otherwise valid audiobook response.
+                }
+            }
+        }
+
+        foreach (var artist in sourceArtists)
+            AddArtist(artist);
+
+        return result;
+    }
+
+    private static YandexArtist? GetSoleTrackArtist(YandexAlbum source)
+    {
+        var artists = source.Volumes
+            .SelectMany(volume => volume ?? new List<YandexTrack>())
+            .SelectMany(track => ExpandArtistContributors(track.Artists))
+            .Where(artist => artist.Id > 0)
+            .GroupBy(artist => artist.Id)
+            .Select(group => group.First())
+            .Take(2)
+            .ToList();
+
+        return artists.Count == 1 ? artists[0] : null;
+    }
+
+    private static YandexArtist? GetFirstTrackArtist(YandexAlbum source)
+    {
+        return source.Volumes
+            .SelectMany(volume => volume ?? new List<YandexTrack>())
+            .SelectMany(track => ExpandArtistContributors(track.Artists))
+            .FirstOrDefault(artist => artist.Id > 0);
+    }
+
+    private static long? TryParseYandexArtistId(string? foreignArtistId)
+    {
+        return !string.IsNullOrWhiteSpace(foreignArtistId) &&
+               YandexIdParser.TryArtistId(foreignArtistId, out var artistId)
+            ? artistId
+            : null;
     }
 
     private static bool IsAudiobook(YandexAlbum source) =>

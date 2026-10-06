@@ -1,3 +1,5 @@
+using Newtonsoft.Json.Linq;
+
 namespace Lidarr.Plugin.YandexMusicMetadata.Api;
 
 
@@ -98,6 +100,11 @@ public sealed class YandexArtist
     public List<string> Genres { get; set; } = new();
     public List<YandexLink> Links { get; set; } = new();
     public List<string> DbAliases { get; set; } = new();
+
+    // Some audiobook credits are encoded as a mixed JSON array containing
+    // separators (strings) and additional artist objects. Keep the raw array
+    // so the metadata provider can flatten all real contributor objects.
+    public JArray? Decomposed { get; set; }
 
     // Enriched from /artists/{id}/about-artist.
     public string? Description { get; set; }
